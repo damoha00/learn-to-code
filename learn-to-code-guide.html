@@ -258,6 +258,10 @@
       height:100vh;transform:translateX(-100%);transition:transform .22s ease;
       box-shadow:0 0 24px rgba(15,23,42,.3);}
     body.navopen .sidebar{transform:translateX(0);}
+    /* The fixed navtoggle button (44px, top:12px left:12px, z-index:70) sits on top
+       of the sidebar's h1 whenever the drawer is open, since both are position:fixed
+       at the same corner. Push the drawer's own content down clear of it. */
+    body.navopen .sidebar{padding-top:66px;}
     .content{padding:64px 26px 40px;max-width:none;}
     .navbtn{padding:11px 10px;font-size:14px;}
     .navbtn .num{width:22px;height:22px;}
@@ -9980,6 +9984,32 @@ npx cap sync</pre>
       <h2 class="title">My Progress Notes</h2>
       <div class="privacy-note">Everything below is stored only in this browser (localStorage) on this device. Nothing is sent anywhere automatically. If you switch browsers or devices, or clear browser data, these notes won't follow you — use "Compile & Download" to back them up as a file.</div>
 
+      <div class="namecard" id="sync-card">
+        <h4>🔄 Sync progress across devices</h4>
+        <p id="sync-explain">Optional. Get a sync code once, then enter that same code on every device — this reads and writes which exercises, flags and badges you've earned to a private online record, alongside this browser's own copy. Your name, these notes and any screenshots never leave this device — only which exercise ids are marked done.</p>
+
+        <div id="sync-setup">
+          <div class="row">
+            <button class="btn" onclick="syncGenerateCode()">Generate a new sync code</button>
+            <span>or</span>
+            <input id="sync-code-input" type="text" placeholder="paste a code from another device" autocomplete="off" spellcheck="false">
+            <button class="btn ghost" onclick="syncEnterCode()">Connect</button>
+          </div>
+        </div>
+
+        <div id="sync-connected" style="display:none;">
+          <div class="row">
+            <strong>This device's sync code:</strong>
+            <code id="sync-code-display" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f1f5f9;padding:3px 8px;border-radius:6px;font-size:13px;"></code>
+            <button class="btn ghost" onclick="syncCopyCode()">Copy</button>
+            <button class="btn danger" onclick="syncDisconnect()">Disconnect this device</button>
+          </div>
+        </div>
+        <div class="ok" id="sync-status" style="display:block;margin-top:8px;"></div>
+
+        <div class="privacy-note" style="margin-top:10px;">Write this code down somewhere safe — there is no password recovery. Anyone who has it can read or add to that progress record, so do not post it publicly.</div>
+      </div>
+
       <div class="note-form">
         <label>Tag to section</label>
         <select id="note-section">
@@ -15246,6 +15276,254 @@ paginateAll();
   .forEach(function(s){ updatePageRail(s); });
 renderClueCase();
 updateClueDock();
+
+// ---------- CROSS-DEVICE SYNC (optional, sync-code based) ----------
+// No login, no email, no password. See build-log/session-7sep-sync-plan-proposed.md
+// for the SQL this depends on: RLS is ON with no policy, so the two Postgres
+// functions below (get_progress / save_progress, both SECURITY DEFINER, both
+// granted to anon) are the only way in. This block is the only place in the whole
+// guide that talks to the network; everything above it works exactly as before if
+// this block is deleted outright, because it changes nothing except by wrapping
+// ONE existing function.
+var SYNC_URL = 'https://vqrptgauyfisxvoawcpp.supabase.co';
+var SYNC_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxcnB0Z2F1eWZpc3h2b2F3Y3BwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ5MjU5NTgsImV4cCI6MjEwMDUwMTk1OH0.EXf-8AnFtJzt0SvZ06h5xKP9w9AobduCwnnc_6w9uKk';
+var SYNC_CODE_KEY = 'lcg_sync_code';
+// Every section that can carry real progress - read straight out of the guide's
+// own chain table plus its one terminal value, so this holds no second copy of a
+// list that already exists.
+var SYNC_ALL_SECTIONS = Object.keys(SECTION_NEXT).concat(['sec-milestone-2']);
+
+function syncGetCode(){
+  try { return localStorage.getItem(SYNC_CODE_KEY) || ''; } catch(e){ return ''; }
+}
+function syncSetCode(code){
+  try { localStorage.setItem(SYNC_CODE_KEY, code); } catch(e){}
+}
+function syncClearCode(){
+  try { localStorage.removeItem(SYNC_CODE_KEY); } catch(e){}
+}
+function syncNewCode(){
+  // No 0/O/1/I - the pairs people misread when copying a code by eye.
+  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  var groups = [];
+  for(var g = 0; g < 4; g++){
+    var s = '';
+    for(var i = 0; i < 4; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+    groups.push(s);
+  }
+  return groups.join('-');
+}
+
+// ---- collect / merge / apply the four synced things ----
+function syncCollectBundle(){
+  var progress = {};
+  SYNC_ALL_SECTIONS.forEach(function(s){ progress[s] = getSectionProgress(s); });
+  var l2 = {};
+  try { l2 = JSON.parse(localStorage.getItem(L2_PREFIX + 'evidence')) || {}; } catch(e){}
+  var awarded = {};
+  try { awarded = JSON.parse(localStorage.getItem(AWARD_DATE_KEY)) || {}; } catch(e){}
+  var goal = null;
+  try { goal = localStorage.getItem(PART2_GOAL_KEY); } catch(e){}
+  return { progress: progress, l2: l2, awarded: awarded, goal: goal };
+}
+
+// Union-merges local against remote. Every piece of real progress only ever
+// turns true / gets recorded / gets added, so a union can never take anything
+// away - the same monotonic rule Phase 4d relied on for locking.
+function syncMergeBundles(local, remote){
+  var changed = false;
+  var out = { progress: {}, l2: {}, awarded: {}, goal: (local && local.goal) || null };
+
+  SYNC_ALL_SECTIONS.forEach(function(s){
+    var l = (local && local.progress && local.progress[s]) || { exercises:{}, flags:{}, puzzleSolved:false };
+    var r = (remote && remote.progress && remote.progress[s]) || { exercises:{}, flags:{}, puzzleSolved:false };
+    var ex = {}, fl = {};
+    Object.keys(l.exercises || {}).forEach(function(k){ if(l.exercises[k]) ex[k] = true; });
+    Object.keys(r.exercises || {}).forEach(function(k){ if(r.exercises[k] && !ex[k]){ ex[k] = true; changed = true; } });
+    Object.keys(l.flags || {}).forEach(function(k){ if(l.flags[k]) fl[k] = true; });
+    Object.keys(r.flags || {}).forEach(function(k){ if(r.flags[k] && !fl[k]){ fl[k] = true; changed = true; } });
+    var puzzleSolved = !!l.puzzleSolved;
+    if(r.puzzleSolved && !puzzleSolved){ puzzleSolved = true; changed = true; }
+    out.progress[s] = { exercises: ex, flags: fl, puzzleSolved: puzzleSolved };
+  });
+
+  var comps = {};
+  Object.keys((local && local.l2) || {}).forEach(function(c){ comps[c] = true; });
+  Object.keys((remote && remote.l2) || {}).forEach(function(c){ comps[c] = true; });
+  Object.keys(comps).forEach(function(c){
+    var l = ((local && local.l2 && local.l2[c]) || []).slice();
+    var r = (remote && remote.l2 && remote.l2[c]) || [];
+    r.forEach(function(capId){ if(l.indexOf(capId) === -1){ l.push(capId); changed = true; } });
+    out.l2[c] = l;
+  });
+
+  ['l1', 'l2'].forEach(function(k){
+    var l = local && local.awarded && local.awarded[k];
+    var r = remote && remote.awarded && remote.awarded[k];
+    var picked;
+    if(l && r) picked = (new Date(l).getTime() <= new Date(r).getTime()) ? l : r;
+    else picked = l || r;
+    if(picked){ out.awarded[k] = picked; if(!l && r) changed = true; }
+  });
+
+  if(!out.goal && remote && remote.goal){ out.goal = remote.goal; changed = true; }
+
+  return { bundle: out, changed: changed };
+}
+
+function syncApplyBundle(bundle){
+  SYNC_ALL_SECTIONS.forEach(function(s){ setSectionProgress(s, bundle.progress[s]); });
+  try { localStorage.setItem(L2_PREFIX + 'evidence', JSON.stringify(bundle.l2 || {})); } catch(e){}
+  try { localStorage.setItem(AWARD_DATE_KEY, JSON.stringify(bundle.awarded || {})); } catch(e){}
+  if(bundle.goal){ try { localStorage.setItem(PART2_GOAL_KEY, bundle.goal); } catch(e){} }
+}
+
+// ---- network: two RPC calls, nothing else ----
+// save_progress returns Postgres void, which PostgREST serves as an empty body
+// (204, on some setups 200-with-nothing) - res.json() throws on that and would
+// misreport every successful save as a failure. get_progress always has a real
+// jsonb body. res.text() first, and only parse if there is anything there,
+// handles both without caring which empty shape the server actually sends.
+function syncCall(fn, payload){
+  return fetch(SYNC_URL + '/rest/v1/rpc/' + fn, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SYNC_ANON_KEY,
+      'Authorization': 'Bearer ' + SYNC_ANON_KEY
+    },
+    body: JSON.stringify(payload)
+  }).then(function(res){
+    if(!res.ok) throw new Error('sync request failed: ' + res.status);
+    return res.text();
+  }).then(function(text){
+    if(!text) return null;
+    try { return JSON.parse(text); } catch(e){ return null; }
+  });
+}
+function syncPull(code){ return syncCall('get_progress', { p_code: code }); }
+function syncPush(code, data){ return syncCall('save_progress', { p_code: code, p_data: data }); }
+
+// ---- UI ----
+function syncSetStatus(text){
+  var el = document.getElementById('sync-status');
+  if(el) el.textContent = text;
+}
+function syncRenderUI(){
+  var code = syncGetCode();
+  var setup = document.getElementById('sync-setup');
+  var connected = document.getElementById('sync-connected');
+  var display = document.getElementById('sync-code-display');
+  if(!setup || !connected) return;
+  if(code){
+    setup.style.display = 'none';
+    connected.style.display = 'block';
+    if(display) display.textContent = code;
+  } else {
+    setup.style.display = 'block';
+    connected.style.display = 'none';
+  }
+}
+function syncGenerateCode(){
+  var code = syncNewCode();
+  syncSetCode(code);
+  syncRenderUI();
+  syncSetStatus('Saving this device\'s progress under the new code\u2026');
+  var local = syncCollectBundle();
+  syncPush(code, local).then(function(){
+    syncSetStatus('Connected. Enter this same code on your other device next.');
+  }).catch(function(){
+    syncSetStatus('Could not reach the sync server yet. The code is saved on this device and will keep trying.');
+  });
+}
+function syncEnterCode(){
+  var input = document.getElementById('sync-code-input');
+  if(!input) return;
+  var code = input.value.trim().toUpperCase();
+  if(!code) return;
+  syncSetCode(code);
+  syncRenderUI();
+  syncSetStatus('Checking for progress already saved under this code\u2026');
+  var local = syncCollectBundle();
+  syncPull(code).then(function(remote){
+    var merged = syncMergeBundles(local, remote || {});
+    syncApplyBundle(merged.bundle);
+    location.reload();
+  }).catch(function(){
+    syncSetStatus('Could not reach the sync server. Check the code and your connection, then try Connect again.');
+  });
+}
+function syncDisconnect(){
+  syncClearCode();
+  syncRenderUI();
+  syncSetStatus('Disconnected. Progress stays on this device; it will not sync until reconnected.');
+}
+function syncCopyCode(){
+  var code = syncGetCode();
+  if(!code) return;
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(code).then(function(){ syncSetStatus('Code copied.'); }).catch(function(){});
+  }
+}
+
+// ---- debounced push, fired from the wrapper below ----
+var SYNC_PUSH_DEBOUNCE_MS = 2500;
+var syncPushTimer = null;
+function syncScheduleWrite(){
+  var code = syncGetCode();
+  if(!code) return;
+  if(syncPushTimer) clearTimeout(syncPushTimer);
+  syncPushTimer = setTimeout(function(){
+    syncPushTimer = null;
+    var code2 = syncGetCode();
+    if(!code2) return;
+    var local = syncCollectBundle();
+    // Pull-then-push, every time: even with no periodic re-pull elsewhere, this
+    // means two devices used a few minutes apart can never clobber one another -
+    // the push always carries the union of whatever the server had a moment ago.
+    syncPull(code2).then(function(remote){
+      return syncMergeBundles(local, remote || {}).bundle;
+    }).catch(function(){
+      return local; // offline: push local alone, next successful round-trip reconciles it
+    }).then(function(toSave){
+      return syncPush(code2, toSave);
+    }).then(function(){
+      syncSetStatus('Synced just now.');
+    }).catch(function(){
+      syncSetStatus('Could not reach the sync server. Saved on this device only for now.');
+    });
+  }, SYNC_PUSH_DEBOUNCE_MS);
+}
+
+// The ONE low-level write function every progress-changing action in the guide
+// already funnels through (markExerciseComplete, markPuzzleSolved, capstone
+// grading). Wrapping it here means nothing above this line has to know sync
+// exists, and nothing above it needed to change.
+var _setSectionProgress_presync = setSectionProgress;
+setSectionProgress = function(sectionId, progress){
+  _setSectionProgress_presync(sectionId, progress);
+  syncScheduleWrite();
+};
+
+// ---- runs once, on every load, only if a code is already stored ----
+(function initSyncOnLoad(){
+  syncRenderUI();
+  var code = syncGetCode();
+  if(!code) return;
+  syncSetStatus('Checking for progress from other devices\u2026');
+  var local = syncCollectBundle();
+  syncPull(code).then(function(remote){
+    var merged = syncMergeBundles(local, remote || {});
+    if(merged.changed){
+      syncApplyBundle(merged.bundle);
+      location.reload();
+    } else {
+      syncSetStatus('Up to date.');
+    }
+  }).catch(function(){
+    syncSetStatus('Offline. Showing progress already saved on this device.');
+  });
+})();
 </script>
 </body>
 </html>
